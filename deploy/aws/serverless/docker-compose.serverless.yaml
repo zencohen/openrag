@@ -1,0 +1,160 @@
+# OpenRAG Serverless Architecture - EC2 Spot Instance
+# Connects to managed Zilliz (Milvus) and Neon (PostgreSQL)
+# Run: docker compose -f docker-compose.serverless.yaml up -d
+
+x-openrag: &openrag_template
+  image: linagoraai/openrag:latest
+  volumes:
+    - openrag-data:/app/data
+    - openrag-model-weights:/app/model_weights
+    - openrag-logs:/app/logs
+  ports:
+    - "8080:8080"
+    - "8090:8090"
+  env_file:
+    - .env
+  environment:
+    # Override for managed services (cloud Milvus)
+    - VDB_HOST=${VDB_HOST}
+    - VDB_PORT=${VDB_PORT:-443}
+    - MILVUS_SECURE=${MILVUS_SECURE:-true}
+    - ZILLIZ_API_KEY=${ZILLIZ_API_KEY}
+    # Override for managed PostgreSQL (Neon)
+    - POSTGRES_HOST=${POSTGRES_HOST}
+    - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+    - POSTGRES_SSLMODE=${POSTGRES_SSLMODE:-require}
+  shm_size: 10.24gb
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 60s
+
+services:
+  # OpenRAG with GPU
+  openrag:
+    <<: *openrag_template
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      vllm-embedder:
+        condition: service_healthy
+    networks:
+      - openrag-net
+
+  # vLLM Embedder (GPU)
+  vllm-embedder:
+    image: vllm/vllm-openai:v0.9.2
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    ipc: "host"
+    volumes:
+      - vllm-cache:/root/.cache/huggingface
+    command: >
+      --model ${EMBEDDER_MODEL_NAME:-jinaai/jina-embeddings-v3}
+      --trust-remote-code
+      --task embed
+      --gpu_memory_utilization 0.4
+      --max-model-len ${MAX_MODEL_LEN:-8192}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 4
+      start_period: 120s
+    restart: unless-stopped
+    networks:
+      openrag-net:
+        aliases:
+          - vllm
+
+  # Reranker (GPU)
+  reranker:
+    image: michaelf34/infinity
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      v2
+      --model-id ${RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
+      --port 7997
+    volumes:
+      - reranker-cache:/app/.cache/huggingface
+    restart: unless-stopped
+    networks:
+      openrag-net:
+        aliases:
+          - reranker
+
+  # Indexer UI
+  indexer-ui:
+    image: linagoraai/indexer-ui:latest
+    environment:
+      - API_BASE_URL=${EXTERNAL_URL:-http://localhost:8080}
+      - INCLUDE_CREDENTIALS=true
+    ports:
+      - "3042:3000"
+    restart: unless-stopped
+    depends_on:
+      - openrag
+    networks:
+      - openrag-net
+
+  # Auto-stop monitor - stops EC2 when idle
+  auto-stop:
+    image: amazon/aws-cli:latest
+    environment:
+      - AUTO_STOP_IDLE_SECONDS=${AUTO_STOP_IDLE_SECONDS:-900}
+      - AWS_DEFAULT_REGION=${AWS_REGION:-us-east-1}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/auto-stop-monitor.sh"]
+    restart: unless-stopped
+    networks:
+      - openrag-net
+
+  # Cloudflare Tunnel (optional - for free HTTPS without domain)
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
+    profiles:
+      - cloudflare
+    depends_on:
+      - openrag
+    networks:
+      - openrag-net
+
+volumes:
+  openrag-data:
+  openrag-model-weights:
+  openrag-logs:
+  vllm-cache:
+  reranker-cache:
+
+networks:
+  openrag-net:
+    driver: bridge

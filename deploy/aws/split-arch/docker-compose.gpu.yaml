@@ -1,0 +1,96 @@
+# OpenRAG Split Architecture - GPU Node (On-Demand)
+# This node provides embeddings and reranking services
+# Start when you need to index documents, stop when done
+# Run: docker compose -f docker-compose.gpu.yaml up -d
+
+x-vllm: &vllm_template
+  restart: unless-stopped
+  environment:
+    - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+  ipc: "host"
+  volumes:
+    - vllm-cache:/root/.cache/huggingface
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+    interval: 20s
+    timeout: 5s
+    retries: 4
+    start_period: 120s
+
+services:
+  # vLLM Embedder (GPU)
+  vllm-embedder:
+    <<: *vllm_template
+    image: vllm/vllm-openai:v0.9.2
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      --model ${EMBEDDER_MODEL_NAME:-jinaai/jina-embeddings-v3}
+      --trust-remote-code
+      --task embed
+      --gpu_memory_utilization 0.4
+      --max-model-len ${MAX_MODEL_LEN:-8192}
+      --host 0.0.0.0
+      --port 8000
+    ports:
+      # Expose to allow CPU node to connect
+      - "0.0.0.0:8000:8000"
+    networks:
+      gpu-net:
+        aliases:
+          - vllm
+          - embedder
+
+  # Reranker (GPU) - Optional but recommended
+  reranker:
+    image: michaelf34/infinity
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      v2
+      --model-id ${RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
+      --port 7997
+      --host 0.0.0.0
+    ports:
+      - "0.0.0.0:7997:7997"
+    volumes:
+      - reranker-cache:/app/.cache/huggingface
+    restart: unless-stopped
+    networks:
+      gpu-net:
+        aliases:
+          - reranker
+
+  # Health check endpoint for CPU node to poll
+  health-proxy:
+    image: nginx:alpine
+    ports:
+      - "0.0.0.0:8080:80"
+    volumes:
+      - ./gpu-health.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      vllm-embedder:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - gpu-net
+
+volumes:
+  vllm-cache:
+  reranker-cache:
+
+networks:
+  gpu-net:
+    driver: bridge

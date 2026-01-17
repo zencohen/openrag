@@ -1,0 +1,176 @@
+# OpenRAG Split Architecture - CPU Node (Always-On)
+# This node handles retrieval, API, and queues indexing jobs
+# Run from openrag root: docker compose -f deploy/aws/split-arch/docker-compose.cpu.yaml up -d
+
+include:
+  - path: ../../../vdb/milvus.yaml
+
+x-openrag: &openrag_template
+  image: linagoraai/openrag:latest
+  volumes:
+    - openrag-data:/app/data
+    - openrag-model-weights:/app/model_weights
+    - openrag-logs:/app/logs
+    - indexing-queue:/app/queue
+    - ../../../.env:/ray_mount/.env:ro
+  ports:
+    - "127.0.0.1:8080:8080"
+    - "127.0.0.1:8265:8265"
+    - "127.0.0.1:8090:8090"
+  networks:
+    openrag-net:
+      aliases:
+        - openrag
+  env_file:
+    - ../../../.env
+  environment:
+    # Connect to remote GPU node for embeddings (when available)
+    - EMBEDDER_BASE_URL=${GPU_NODE_URL:-http://gpu-node:8000}/v1
+    - RERANKER_BASE_URL=${GPU_NODE_URL:-http://gpu-node:7997}
+    # Queue mode: queue indexing when GPU offline
+    - INDEXING_MODE=${INDEXING_MODE:-queue}
+  shm_size: 4gb
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 60s
+
+services:
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../../../nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../../../ssl:/etc/nginx/ssl:ro
+      - certbot-webroot:/var/www/certbot:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      - openrag
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    networks:
+      openrag-net:
+        aliases:
+          - nginx
+
+  # Certbot for SSL
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - ../../../ssl:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    restart: unless-stopped
+    networks:
+      - openrag-net
+
+  # OpenRAG API (CPU mode)
+  openrag:
+    <<: *openrag_template
+    # No GPU reservation
+    deploy: {}
+    depends_on:
+      rdb:
+        condition: service_started
+      milvus:
+        condition: service_healthy
+
+  # Indexer UI
+  indexer-ui:
+    image: linagoraai/indexer-ui:latest
+    environment:
+      - API_BASE_URL=${EXTERNAL_URL:-http://localhost:8080}
+      - INCLUDE_CREDENTIALS=${INCLUDE_CREDENTIALS:-true}
+    ports:
+      - "127.0.0.1:3042:3000"
+    restart: unless-stopped
+    depends_on:
+      - openrag
+    networks:
+      - openrag-net
+
+  # PostgreSQL
+  rdb:
+    image: postgres:15
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_USER=${POSTGRES_USER:-openrag}
+      - POSTGRES_DB=${POSTGRES_DB:-openrag}
+      - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Expose to allow GPU node to connect
+    ports:
+      - "${CPU_NODE_IP:-127.0.0.1}:5432:5432"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openrag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - openrag-net
+
+  # Queue processor - watches for indexing jobs and processes when GPU available
+  queue-processor:
+    image: linagoraai/openrag:latest
+    volumes:
+      - indexing-queue:/app/queue
+      - ../../../.env:/ray_mount/.env:ro
+    environment:
+      - GPU_NODE_URL=${GPU_NODE_URL:-http://gpu-node:8000}
+      - QUEUE_CHECK_INTERVAL=${QUEUE_CHECK_INTERVAL:-60}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Queue processor starting..."
+        while true; do
+          # Check if GPU node is available
+          if curl -sf "$${GPU_NODE_URL}/health" > /dev/null 2>&1; then
+            echo "GPU node available, processing queue..."
+            # Process any queued indexing jobs
+            for job in /app/queue/*.json; do
+              if [ -f "$$job" ]; then
+                echo "Processing: $$job"
+                # Send to OpenRAG API for processing
+                curl -X POST http://openrag:8080/indexer/process-queue \
+                  -H "Content-Type: application/json" \
+                  -d @"$$job" && rm "$$job"
+              fi
+            done
+          else
+            echo "GPU node offline, waiting..."
+          fi
+          sleep $${QUEUE_CHECK_INTERVAL:-60}
+        done
+    restart: unless-stopped
+    depends_on:
+      - openrag
+    networks:
+      - openrag-net
+
+volumes:
+  openrag-data:
+  openrag-model-weights:
+  openrag-logs:
+  postgres-data:
+  certbot-webroot:
+  nginx-logs:
+  indexing-queue:
+
+networks:
+  openrag-net:
+    driver: bridge

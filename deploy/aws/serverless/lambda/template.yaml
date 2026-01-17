@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: OpenRAG Serverless Wake Function
+
+Parameters:
+  EC2InstanceId:
+    Type: String
+    Description: The EC2 instance ID to wake
+  OpenRAGPort:
+    Type: String
+    Default: "8080"
+    Description: Port OpenRAG listens on
+
+Globals:
+  Function:
+    Timeout: 300
+    Runtime: python3.11
+    MemorySize: 256
+
+Resources:
+  # Lambda function to wake EC2
+  WakeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: openrag-wake
+      CodeUri: wake-openrag/
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          EC2_INSTANCE_ID: !Ref EC2InstanceId
+          OPENRAG_PORT: !Ref OpenRAGPort
+          MAX_WAIT_SECONDS: "300"
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:StartInstances
+              Resource: '*'
+      Events:
+        WakeApi:
+          Type: Api
+          Properties:
+            Path: /wake
+            Method: POST
+            RestApiId: !Ref OpenRAGApi
+        HealthApi:
+          Type: Api
+          Properties:
+            Path: /status
+            Method: GET
+            RestApiId: !Ref OpenRAGApi
+
+  # API Gateway
+  OpenRAGApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: openrag-serverless-api
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+  # EventBridge rule to wake on schedule (optional)
+  ScheduledWake:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: openrag-scheduled-wake
+      Description: Wake OpenRAG on schedule
+      ScheduleExpression: cron(0 8 * * ? *)  # 8 AM UTC daily
+      State: DISABLED  # Enable if you want scheduled wake
+      Targets:
+        - Id: WakeTarget
+          Arn: !GetAtt WakeFunction.Arn
+
+  ScheduledWakePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WakeFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledWake.Arn
+
+Outputs:
+  WakeApiUrl:
+    Description: URL to wake OpenRAG
+    Value: !Sub "https://${OpenRAGApi}.execute-api.${AWS::Region}.amazonaws.com/prod/wake"
+  StatusApiUrl:
+    Description: URL to check OpenRAG status
+    Value: !Sub "https://${OpenRAGApi}.execute-api.${AWS::Region}.amazonaws.com/prod/status"
+  WakeFunctionArn:
+    Description: Wake Lambda function ARN
+    Value: !GetAtt WakeFunction.Arn
