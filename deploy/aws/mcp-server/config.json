@@ -1,0 +1,6 @@
+{
+  "openrag_url": "https://your-openrag-instance.com",
+  "api_token": "sk-openrag-your-token-here",
+  "default_partition": "default",
+  "timeout": 30
+}

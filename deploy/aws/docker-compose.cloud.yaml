@@ -1,0 +1,158 @@
+# OpenRAG Cloud Deployment - AWS EC2 with GPU
+# Optimized for personal cloud deployment with secure remote access
+# Run from the openrag root directory: docker compose -f deploy/aws/docker-compose.cloud.yaml up -d
+
+include:
+  - path: ../../vdb/milvus.yaml
+  - path: ../../extern/infinity.yaml
+
+x-openrag: &openrag_template
+  image: linagoraai/openrag:latest
+  volumes:
+    - openrag-data:/app/data
+    - openrag-model-weights:/app/model_weights
+    - openrag-logs:/app/logs
+    - ../../.env:/ray_mount/.env:ro
+  ports:
+    - "127.0.0.1:8080:8080"  # Only expose locally, use reverse proxy for external
+    - "127.0.0.1:8265:8265"  # Ray dashboard - local only
+    - "127.0.0.1:8090:8090"  # Chainlit UI - local only
+  networks:
+    default:
+      aliases:
+        - openrag
+  env_file:
+    - ../../.env
+  shm_size: 10.24gb
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 60s
+
+x-vllm: &vllm_template
+  networks:
+    default:
+      aliases:
+        - vllm
+  restart: unless-stopped
+  environment:
+    - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+  ipc: "host"
+  volumes:
+    - vllm-cache:/root/.cache/huggingface
+  command: >
+    --model ${EMBEDDER_MODEL_NAME:-jinaai/jina-embeddings-v3}
+    --trust-remote-code
+    --task embed
+    --gpu_memory_utilization 0.3
+    --max-model-len ${MAX_MODEL_LEN:-8192}
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+    interval: 20s
+    timeout: 5s
+    retries: 4
+    start_period: 120s
+
+services:
+  # Nginx reverse proxy with SSL termination
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../../nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../../ssl:/etc/nginx/ssl:ro
+      - certbot-webroot:/var/www/certbot:ro
+    depends_on:
+      - openrag
+    restart: unless-stopped
+    networks:
+      default:
+        aliases:
+          - nginx
+
+  # Certbot for SSL certificates
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - ../../ssl:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    restart: unless-stopped
+
+  # OpenRAG with GPU
+  openrag:
+    <<: *openrag_template
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      rdb:
+        condition: service_started
+      milvus:
+        condition: service_healthy
+      vllm-gpu:
+        condition: service_healthy
+
+  # Indexer UI
+  indexer-ui:
+    image: linagoraai/indexer-ui:latest
+    environment:
+      - API_BASE_URL=${EXTERNAL_URL:-http://localhost:8080}
+      - INCLUDE_CREDENTIALS=${INCLUDE_CREDENTIALS:-true}
+    ports:
+      - "127.0.0.1:3042:3000"
+    restart: unless-stopped
+    depends_on:
+      - openrag
+
+  # PostgreSQL database
+  rdb:
+    image: postgres:15
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_USER=${POSTGRES_USER:-openrag}
+      - POSTGRES_DB=${POSTGRES_DB:-openrag}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    expose:
+      - 5432
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openrag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # vLLM for embeddings (GPU)
+  vllm-gpu:
+    <<: *vllm_template
+    image: vllm/vllm-openai:v0.9.2
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  openrag-data:
+  openrag-model-weights:
+  openrag-logs:
+  vllm-cache:
+  postgres-data:
+  certbot-webroot:
+
+networks:
+  default:
+    driver: bridge
