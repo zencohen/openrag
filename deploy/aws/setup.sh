@@ -110,9 +110,139 @@ install_dependencies() {
         git \
         jq \
         openssl \
-        ufw
+        ufw \
+        fail2ban \
+        unattended-upgrades \
+        logrotate
 
     log_success "System dependencies installed"
+}
+
+setup_fail2ban() {
+    log_info "Configuring fail2ban for SSH protection..."
+
+    # Create fail2ban jail configuration
+    cat > /etc/fail2ban/jail.local << 'FAIL2BAN'
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 5
+backend = systemd
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 86400
+
+[nginx-http-auth]
+enabled = true
+filter = nginx-http-auth
+port = http,https
+logpath = /var/log/nginx/error.log
+maxretry = 5
+
+[nginx-limit-req]
+enabled = true
+filter = nginx-limit-req
+port = http,https
+logpath = /var/log/nginx/error.log
+maxretry = 10
+FAIL2BAN
+
+    # Create nginx rate limit filter
+    cat > /etc/fail2ban/filter.d/nginx-limit-req.conf << 'FILTER'
+[Definition]
+failregex = limiting requests, excess:.* by zone.*client: <HOST>
+ignoreregex =
+FILTER
+
+    systemctl enable fail2ban
+    systemctl restart fail2ban
+
+    log_success "fail2ban configured"
+}
+
+setup_automatic_updates() {
+    log_info "Configuring automatic security updates..."
+
+    cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'UPDATES'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}";
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+Unattended-Upgrade::Package-Blacklist {
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+UPDATES
+
+    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'AUTO'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+AUTO
+
+    systemctl enable unattended-upgrades
+    log_success "Automatic security updates configured"
+}
+
+setup_log_rotation() {
+    log_info "Configuring log rotation..."
+
+    cat > /etc/logrotate.d/openrag << 'LOGROTATE'
+/opt/openrag/logs/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 root root
+    sharedscripts
+    postrotate
+        docker compose -f /opt/openrag/deploy/aws/docker-compose.cloud.yaml kill -s USR1 nginx 2>/dev/null || true
+    endscript
+}
+LOGROTATE
+
+    log_success "Log rotation configured"
+}
+
+harden_ssh() {
+    log_info "Hardening SSH configuration..."
+
+    # Backup original config
+    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+
+    # Apply hardening (only if not already configured)
+    if ! grep -q "# OpenRAG Security Hardening" /etc/ssh/sshd_config; then
+        cat >> /etc/ssh/sshd_config << 'SSHD'
+
+# OpenRAG Security Hardening
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+PubkeyAuthentication yes
+MaxAuthTries 3
+ClientAliveInterval 300
+ClientAliveCountMax 2
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+SSHD
+
+        systemctl restart sshd
+        log_success "SSH hardened"
+    else
+        log_info "SSH already hardened, skipping"
+    fi
 }
 
 install_docker() {
@@ -224,16 +354,24 @@ setup_deploy_directory() {
 }
 
 generate_self_signed_cert() {
-    log_info "Generating self-signed SSL certificate..."
+    log_info "Generating self-signed SSL certificate with strong key..."
 
     mkdir -p "$DEPLOY_DIR/ssl/live/openrag"
 
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout "$DEPLOY_DIR/ssl/live/openrag/privkey.pem" \
+    # Generate ECDSA key (stronger and faster than RSA)
+    openssl ecparam -genkey -name secp384r1 -out "$DEPLOY_DIR/ssl/live/openrag/privkey.pem"
+
+    # Generate certificate
+    openssl req -new -x509 -sha384 -days 365 \
+        -key "$DEPLOY_DIR/ssl/live/openrag/privkey.pem" \
         -out "$DEPLOY_DIR/ssl/live/openrag/fullchain.pem" \
         -subj "/CN=${DOMAIN:-localhost}/O=OpenRAG/C=US"
 
-    log_success "Self-signed certificate generated"
+    # Set secure permissions
+    chmod 600 "$DEPLOY_DIR/ssl/live/openrag/privkey.pem"
+    chmod 644 "$DEPLOY_DIR/ssl/live/openrag/fullchain.pem"
+
+    log_success "Self-signed certificate generated (ECDSA P-384)"
 }
 
 setup_letsencrypt() {
@@ -481,7 +619,13 @@ main() {
         install_nvidia_drivers
     fi
 
+    # Security hardening
     setup_firewall
+    setup_fail2ban
+    setup_automatic_updates
+    setup_log_rotation
+    harden_ssh
+
     setup_deploy_directory
 
     if [[ "$SKIP_SSL" == "true" ]]; then

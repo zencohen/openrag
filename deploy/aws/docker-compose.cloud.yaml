@@ -67,9 +67,16 @@ services:
       - ../../nginx.conf:/etc/nginx/nginx.conf:ro
       - ../../ssl:/etc/nginx/ssl:ro
       - certbot-webroot:/var/www/certbot:ro
+      - nginx-logs:/var/log/nginx
     depends_on:
       - openrag
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
     networks:
       default:
         aliases:
@@ -121,11 +128,14 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_USER=${POSTGRES_USER:-openrag}
       - POSTGRES_DB=${POSTGRES_DB:-openrag}
+      - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
     volumes:
       - postgres-data:/var/lib/postgresql/data
     expose:
       - 5432
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openrag}"]
       interval: 10s
@@ -152,6 +162,7 @@ volumes:
   vllm-cache:
   postgres-data:
   certbot-webroot:
+  nginx-logs:
 
 networks:
   default:

@@ -234,6 +234,26 @@ For non-critical personal use, consider using Spot Instances:
 - `g4dn.xlarge` Spot: ~$0.15/hour vs $0.52/hour On-Demand
 - Use persistent Spot requests with stop behavior
 
+## Security Testing
+
+Run security tests to verify your deployment:
+
+```bash
+# Pre-deployment: Verify configuration files
+./deploy/aws/security-tests/verify-config.sh
+
+# Post-deployment: Full security scan
+./deploy/aws/security-tests/run-security-tests.sh \
+    --url https://your-domain.com \
+    --token sk-openrag-your-token
+```
+
+See [security-tests/README.md](security-tests/README.md) for details on:
+- SSL/TLS testing with testssl.sh
+- Container scanning with Trivy
+- System auditing with Lynis
+- API security testing
+
 ## Files Reference
 
 ```
@@ -246,5 +266,9 @@ deploy/aws/
 │   ├── openrag-mcp-server.py
 │   ├── config.json
 │   └── requirements.txt
+├── security-tests/            # Security testing suite
+│   ├── run-security-tests.sh  # Full security scan
+│   ├── verify-config.sh       # Pre-deployment check
+│   └── README.md              # Security test docs
 └── README.md                  # This file
 ```
